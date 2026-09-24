@@ -1,6 +1,13 @@
 import os  # 导入 os 模块，用于读取环境变量（API Key）
 import asyncio  # 导入 asyncio，用于运行异步评估流程
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings  # 导入向量索引、目录读取器与全局配置 Settings
+from pathlib import Path  # 用脚本位置定位 PDF、评估集和本地 NLTK 数据
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 仓库根目录，不依赖 PyCharm 的工作目录
+DATASET_PATH = Path(__file__).resolve().parent / "c6_response_eval_dataset.json"  # 评估数据集文件
+PDF_PATH = PROJECT_ROOT / "data" / "C3" / "pdf" / "IPCC_AR6_WGII_Chapter03.pdf"  # 待评估的 PDF
+os.environ.setdefault("NLTK_DATA", str(PROJECT_ROOT / ".cache" / "nltk"))  # 让 LlamaIndex 使用项目 D 盘上的 NLTK 资源
+
+from llama_index.core import Document, VectorStoreIndex, SimpleDirectoryReader, Settings  # 导入文档、向量索引、目录读取器与全局配置
 from llama_index.core.node_parser import SentenceWindowNodeParser, SentenceSplitter  # 导入句子窗口解析器与句子切分器
 from llama_index.llms.deepseek import DeepSeek  # 导入 DeepSeek 大模型封装
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # 导入 HuggingFace 嵌入模型封装
@@ -13,23 +20,41 @@ from llama_index.core.evaluation import (  # 从评估模块导入以下评估�
 from llama_index.core.evaluation.eval_utils import get_results_df  # 导入结果转 DataFrame 的工具（便于查看评估明细）
 from llama_index.core.evaluation import DatasetGenerator, QueryResponseDataset  # 导入数据集生成器与查询-响应数据集
 
+MAX_PDF_PAGES = 10  # 快速验证只读取前 10 页；改为 None 可读取整本 PDF
+MAX_EVAL_QUERIES = 3  # 快速验证只评估前 3 个问题；改为 None 可评估全部问题
+
 Settings.llm = DeepSeek(model="deepseek-chat", temperature=0.1, api_key=os.getenv("DEEPSEEK_API_KEY"))  # 全局设置 LLM 为 DeepSeek（作为评估裁判与生成模型）
 Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en")  # 全局设置嵌入模型为 bge-small-en
 
 async def main():  # 定义异步主函数
     # 1. 加载文档
-    reader = SimpleDirectoryReader(input_files=["../../data/C3/pdf/IPCC_AR6_WGII_Chapter03.pdf"])  # 创建目录读取器，指定要读取的 PDF 文件
-    documents = reader.load_data()  # 加载文档内容为文档对象列表
+    if MAX_PDF_PAGES is None:  # 完整模式：让 LlamaIndex 读取 PDF 的全部页面
+        reader = SimpleDirectoryReader(input_files=[str(PDF_PATH)])  # 使用绝对路径，避免工作目录变化造成找不到 PDF
+        documents = reader.load_data()  # 加载文档内容为文档对象列表
+    else:  # 快速模式：只解析需要的页，避免先花约 40 秒读取整本 PDF
+        from pypdf import PdfReader  # 与 LlamaIndex 默认 PDFReader 使用相同的 PDF 解析库
+
+        with PDF_PATH.open("rb") as pdf_file:  # 保持文件打开，直到选定页面的文字提取完毕
+            pdf = PdfReader(pdf_file)  # 读取页数和页面对象，不立即解析全部页面文本
+            page_count = min(MAX_PDF_PAGES, len(pdf.pages))  # 文件不足 10 页时只读实际页数
+            documents = [  # 每页建立一个 Document，元数据与 LlamaIndex 的 PDFReader 保持一致
+                Document(
+                    text=pdf.pages[page].extract_text() or "",  # 只提取选定页面的文字
+                    metadata={"page_label": pdf.page_labels[page], "file_name": PDF_PATH.name},
+                )
+                for page in range(page_count)
+            ]
+    print(f"已读取 PDF：{len(documents)} 页")  # 让耗时阶段的进度可见
 
     # 1.1 加载或生成响应评估数据集
-    if os.path.exists("./c6_response_eval_dataset.json"):  # 若本地已存在评估数据集文件
+    if DATASET_PATH.is_file():  # 若本地已存在评估数据集文件
         print("加载响应评估数据集...")  # 打印提示
-        response_eval_dataset = QueryResponseDataset.from_json("./c6_response_eval_dataset.json")  # 直接从 JSON 加载，避免重复生成
+        response_eval_dataset = QueryResponseDataset.from_json(str(DATASET_PATH))  # 直接从 JSON 加载，避免重复生成
     else:  # 否则需要生成数据集
         print("生成响应评估数据集...")  # 打印提示
         dataset_generator = DatasetGenerator.from_documents(documents[:10])  # 用前 10 篇文档创建数据集生成器（限制数量以节省时间）
         response_eval_dataset = await dataset_generator.agenerate_dataset_from_nodes(num=15)  # 异步生成 15 个"问题-答案"对
-        response_eval_dataset.save_json("./c6_response_eval_dataset.json")  # 保存数据集到本地，方便复用
+        response_eval_dataset.save_json(str(DATASET_PATH))  # 保存数据集到本地，方便复用
 
 
 
@@ -41,7 +66,8 @@ async def main():  # 定义异步主函数
         original_text_metadata_key="original_text",  # 把原始句子存入元数据键 "original_text"
     )
     sentence_nodes = sentence_parser.get_nodes_from_documents(documents)  # 用该解析器把文档切分成节点
-    sentence_index = VectorStoreIndex(sentence_nodes)  # 基于句子窗口节点构建向量索引
+    print(f"句子窗口：{len(sentence_nodes)} 个节点，开始生成向量...")
+    sentence_index = VectorStoreIndex(sentence_nodes, show_progress=True)  # 构建索引并显示嵌入进度
 
     sentence_query_engine = sentence_index.as_query_engine(  # 把索引封装成查询引擎
         similarity_top_k=2,  # 检索时取最相似的 2 个节点
@@ -54,7 +80,8 @@ async def main():  # 定义异步主函数
     # 2.2 常规分块检索（基准）
     base_parser = SentenceSplitter(chunk_size=512)  # 创建常规句子切分器，块大小 512
     base_nodes = base_parser.get_nodes_from_documents(documents)  # 用该切分器把文档切成块节点
-    base_index = VectorStoreIndex(base_nodes)  # 基于常规分块节点构建向量索引
+    print(f"常规分块：{len(base_nodes)} 个节点，开始生成向量...")
+    base_index = VectorStoreIndex(base_nodes, show_progress=True)  # 构建索引并显示嵌入进度
 
     base_query_engine = base_index.as_query_engine(similarity_top_k=2)  # 把基准索引封装成查询引擎（Top-2）
     base_retriever = base_index.as_retriever(similarity_top_k=2)  # 基于基准索引创建检索器（Top-2）
@@ -66,7 +93,8 @@ async def main():  # 定义异步主函数
     # 4. 执行响应评估对比
     print("开始执行响应评估对比...")  # 打印提示
     evaluators = {"faithfulness": faithfulness_evaluator, "relevancy": relevancy_evaluator}  # 组装评估器字典（多维度）
-    queries = response_eval_dataset.queries  # 从数据集中取出所有问题列表
+    queries = response_eval_dataset.questions[:MAX_EVAL_QUERIES]  # questions 才是问题文本；queries 是 ID → 文本的字典
+    print(f"本次评估 {len(queries)} 个问题")  # 快速模式默认 3 个问题，避免一开始发起过多云端请求
 
     # 句子窗口检索响应评估
     print("\n=== 评估句子窗口检索 ===")  # 打印小节标题
