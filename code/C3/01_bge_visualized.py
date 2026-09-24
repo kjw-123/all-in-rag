@@ -1,16 +1,27 @@
 import torch
+from pathlib import Path
 from visual_bge.visual_bge.modeling import Visualized_BGE
 
+project_root = Path(__file__).resolve().parents[2]
+model_path = project_root / "models" / "bge" / "Visualized_base_en_v1.5.pth"
+image_dir = project_root / "data" / "C3" / "imgs"
+
+if not model_path.is_file():
+    raise FileNotFoundError(
+        f"缺少模型权重：{model_path}\n"
+        "请先在 code/C3 目录运行 python download_model.py 下载模型。"
+    )
+
 model = Visualized_BGE(model_name_bge="BAAI/bge-base-en-v1.5",
-                      model_weight="../../models/bge/Visualized_base_en_v1.5.pth")
+                      model_weight=str(model_path))
 model.eval()
 
 with torch.no_grad():
     text_emb = model.encode(text="datawhale开源组织的logo")
-    img_emb_1 = model.encode(image="../../data/C3/imgs/datawhale01.png")
-    multi_emb_1 = model.encode(image="../../data/C3/imgs/datawhale01.png", text="datawhale开源组织的logo")
-    img_emb_2 = model.encode(image="../../data/C3/imgs/datawhale02.png")
-    multi_emb_2 = model.encode(image="../../data/C3/imgs/datawhale02.png", text="datawhale开源组织的logo")
+    img_emb_1 = model.encode(image=str(image_dir / "datawhale01.png"))
+    multi_emb_1 = model.encode(image=str(image_dir / "datawhale01.png"), text="datawhale开源组织的logo")
+    img_emb_2 = model.encode(image=str(image_dir / "datawhale02.png"))
+    multi_emb_2 = model.encode(image=str(image_dir / "datawhale02.png"), text="datawhale开源组织的logo")
 
 # 计算相似度
 sim_1 = img_emb_1 @ img_emb_2.T

@@ -1,0 +1,5 @@
+# 阿里云百炼云端向量 + Elasticsearch 示例所需依赖；无需本地模型。
+elasticsearch==8.19.3
+numpy
+requests
+python-dotenv
